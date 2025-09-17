@@ -12,7 +12,7 @@ from typing import Dict, Any
 
 import openai
 from dotenv import load_dotenv
-from livekit import rtc
+from livekit import api, rtc
 from livekit.agents import JobContext, WorkerOptions, cli
 from mem0 import MemoryClient
 
@@ -128,32 +128,45 @@ Be friendly and remember you're in a chat environment.
     async def send_message(self, message: str):
         """Send message to the room"""
         if not self.room:
+            logger.error("Cannot send message: Room not initialized")
             return
             
         try:
             message_data = {
                 "message": message,
-                "sender": os.getenv("AGENT_IDENTITY", "AI Assistant"),
+                "sender": os.getenv("AGENT_IDENTITY", "AI-Assistant"),
                 "timestamp": asyncio.get_event_loop().time()
             }
             
             data = json.dumps(message_data).encode('utf-8')
             await self.room.local_participant.publish_data(data, reliable=True)
+            logger.info(f"Sent message: {message}")
             
         except Exception as e:
             logger.error(f"Error sending message: {e}")
 
-    async def handle_message(self, data: rtc.DataPacket, participant: rtc.RemoteParticipant):
-        """Handle incoming messages"""
+    async def _handle_message_async(self, data: rtc.DataPacket, participant: rtc.RemoteParticipant):
+        """Async message handler - internal method"""
         try:
+            logger.info(f"Raw data received: {data.data.decode('utf-8')}")
+            logger.info(f"From participant: {participant.identity if participant else 'None'}")
+            
             message_str = data.data.decode('utf-8')
             message_data = json.loads(message_str)
+            logger.info(f"Parsed message data: {message_data}")
             
             user_message = message_data.get('message', '').strip()
-            username = message_data.get('sender') or participant.identity
-            agent_identity = os.getenv("AGENT_IDENTITY", "AI Assistant")
+            username = message_data.get('sender') or (participant.identity if participant else 'Unknown')
+            agent_identity = os.getenv("AGENT_IDENTITY", "AI-Assistant")
             
-            if not user_message or username == agent_identity:
+            logger.info(f"Processing: message='{user_message}', username='{username}', agent='{agent_identity}'")
+            
+            if not user_message:
+                logger.info("Skipping empty message")
+                return
+                
+            if username == agent_identity:
+                logger.info("Skipping message from self")
                 return
                 
             logger.info(f"Message from {username}: {user_message}")
@@ -161,6 +174,8 @@ Be friendly and remember you're in a chat environment.
             # Get context and generate response
             context = await self.get_user_context(username, user_message)
             ai_response = await self.generate_response(user_message, username, context)
+            
+            logger.info(f"Generated response: {ai_response}")
             
             # Send response
             await self.send_message(ai_response)
@@ -173,52 +188,70 @@ Be friendly and remember you're in a chat environment.
             logger.info(f"Responded to {username}")
             
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            logger.error(f"Error handling message: {e}", exc_info=True)
 
-    async def handle_participant_connected(self, participant: rtc.RemoteParticipant):
-        """Handle new participant"""
-        agent_identity = os.getenv("AGENT_IDENTITY", "AI Assistant")
+    def handle_message(self, data: rtc.DataPacket, participant: rtc.RemoteParticipant = None):
+        """Synchronous wrapper for message handling"""
+        logger.info(f"Received data packet: {data.data.decode('utf-8')}, from: {participant.identity if participant else 'None'}")
+        asyncio.create_task(self._handle_message_async(data, participant))
+
+    async def _handle_participant_connected_async(self, participant: rtc.RemoteParticipant):
+        """Async participant handler - internal method"""
+        logger.info(f"Participant connected: {participant.identity}, metadata: {participant.metadata}")
+        agent_identity = os.getenv("AGENT_IDENTITY", "AI-Assistant")
         if participant.identity != agent_identity:
-            logger.info(f"Participant joined: {participant.identity}")
+            logger.info(f"Sending greeting to {participant.identity}")
             await asyncio.sleep(1)
             
             # Check if we have context for returning user
             context = await self.get_user_context(participant.identity)
-            if "No previous context found" in context:
-                greeting = f"Hello {participant.identity}! 👋 I'm {agent_identity}. How can I help you today?"
-            else:
-                greeting = f"Welcome back, {participant.identity}! 😊 Great to see you again!"
-                
+            greeting = (
+                f"Hello {participant.identity}! 👋 I'm {agent_identity}. How can I help you today?"
+                if "No previous context found" in context
+                else f"Welcome back, {participant.identity}! 😊 Great to see you again!"
+            )
             await self.send_message(greeting)
+            logger.info(f"Sent greeting: {greeting}")
+
+    def handle_participant_connected(self, participant: rtc.RemoteParticipant):
+        """Synchronous wrapper for participant connected handling"""
+        asyncio.create_task(self._handle_participant_connected_async(participant))
 
     async def entrypoint(self, ctx: JobContext):
         """Main entry point"""
         try:
-            logger.info(f"Connecting to room: {ctx.room.name}")
-            
-            # Initialize services
+            # Initialize services BEFORE connecting
             self._init_services()
             
-            # Connect to room
-            await ctx.connect(auto_subscribe=rtc.AutoSubscribeRule.SUBSCRIBE_NONE)
+            # Get room name from request or environment
+            room_name = ctx.job.room.name if ctx.job and ctx.job.room else os.getenv("DEFAULT_ROOM", "chat-room")
+            logger.info(f"Connecting to room: {room_name}")
+            
+            # Connect to room 
+            await ctx.connect()
             self.room = ctx.room
             
-            # Set up event handlers
-            ctx.room.on("data_received", self.handle_message)
-            ctx.room.on("participant_connected", self.handle_participant_connected)
+            logger.info(f"Connected to room: {room_name}, local participant: {self.room.local_participant.identity}")
             
-            # Send welcome message
+            # Set up event handlers AFTER connection
+            self.room.on("data_received", self.handle_message)
+            self.room.on("participant_connected", self.handle_participant_connected)
+            
+            # Send welcome message after a short delay
             await asyncio.sleep(2)
-            agent_identity = os.getenv("AGENT_IDENTITY", "AI Assistant")
+            agent_identity = os.getenv("AGENT_IDENTITY", "AI-Assistant")
             welcome = f"👋 Hi everyone! I'm {agent_identity}, your AI assistant. I remember our conversations!"
             await self.send_message(welcome)
             
             logger.info("Agent successfully connected and ready!")
             
+            # Keep the agent running
+            while True:
+                await asyncio.sleep(1)
+                
         except Exception as e:
-            logger.error(f"Error in entrypoint: {e}")
+            logger.error(f"Error in entrypoint: {e}", exc_info=True)
             raise
-
 
 # Global agent instance
 agent = SimpleAgent()
@@ -250,19 +283,15 @@ def main():
         validate_config()
         
         logger.info("🚀 Starting AI Chat Agent...")
-        logger.info(f"🤖 Agent: {os.getenv('AGENT_IDENTITY', 'AI Assistant')}")
+        logger.info(f"🤖 Agent: {os.getenv('AGENT_IDENTITY', 'AI-Assistant')}")
         logger.info(f"🔗 LiveKit: {os.getenv('LIVEKIT_WS_URL')}")
         logger.info(f"🧠 LLM: {os.getenv('LLM_MODEL', 'gpt-3.5-turbo')}")
 
-        # Create WorkerOptions with environment variables
-        options = WorkerOptions(
-            entrypoint_fnc=agent.entrypoint,
-            api_key=os.getenv("LIVEKIT_API_KEY"),
-            api_secret=os.getenv("LIVEKIT_API_SECRET"),
-            ws_url=os.getenv("LIVEKIT_WS_URL")
+        cli.run_app(
+            WorkerOptions(
+                entrypoint_fnc=agent.entrypoint,
+            )
         )
-        
-        cli.run_app(options)
         
     except KeyboardInterrupt:
         logger.info("👋 Shutting down...")

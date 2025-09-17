@@ -17,6 +17,13 @@ export async function POST(request: NextRequest) {
     const apiSecret = process.env.LIVEKIT_API_SECRET
     const wsUrl = process.env.NEXT_PUBLIC_LIVEKIT_WS_URL
 
+    console.log('Environment check:', {
+      hasApiKey: !!apiKey,
+      hasApiSecret: !!apiSecret,
+      hasWsUrl: !!wsUrl,
+      wsUrl
+    })
+
     if (!apiKey || !apiSecret || !wsUrl) {
       return NextResponse.json(
         { error: 'Server configuration error' },
@@ -33,9 +40,10 @@ export async function POST(request: NextRequest) {
         name: roomName,
         maxParticipants: 50,
       })
+      console.log(`Room ${roomName} created or already exists`)
     } catch (error: any) {
       // Room might already exist, which is fine
-      console.log('Room might already exist:', error?.message)
+      console.log('Room creation result:', error?.message)
     }
 
     // Create access token
@@ -47,12 +55,15 @@ export async function POST(request: NextRequest) {
     at.addGrant({
       room: roomName,
       roomJoin: true,
-      canPublish: false, // We only need chat, not audio/video
-      canSubscribe: false, // We only need chat, not audio/video
-      canPublishData: true, // Allow sending chat messages
+      canPublish: true,      // Allow publishing audio/video (even if we don't use it)
+      canSubscribe: true,    // Allow subscribing to audio/video (even if we don't use it)
+      canPublishData: true,  // Allow sending chat messages
+      canUpdateOwnMetadata: true, // Allow updating own metadata
     })
 
     const token = await at.toJwt()
+
+    console.log(`Generated token for ${username} in room ${roomName}`)
 
     return NextResponse.json({
       token,
